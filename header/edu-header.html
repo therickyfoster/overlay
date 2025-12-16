@@ -1,0 +1,273 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Edu Gamification Header</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root{
+      --bg:#0b1220; --card:#111a2e; --ink:#eaf0ff; --ink-dim:#a9b5d9; --accent:#6cb2ff; --ring:#253150;
+    }
+    body{margin:0;background:transparent;color:var(--ink);font-family:system-ui,Segoe UI,Roboto,sans-serif;}
+    edu-header{display:block}
+  </style>
+</head>
+<body>
+  <edu-header data-title="Daily Loom" data-modules='[]'></edu-header>
+
+  <script type="module">
+    // ===== Utilities =====
+    const sha256 = async (strOrBuf) => {
+      const buf = typeof strOrBuf === "string" ? new TextEncoder().encode(strOrBuf) : strOrBuf;
+      const hash = await crypto.subtle.digest("SHA-256", buf);
+      return Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    };
+    const todayKey = (d=new Date()) => d.toDateString();
+
+    // ===== Minimal CSS injected by component =====
+    const styles = `
+      .hdr{position:relative; display:flex; gap:.75rem; align-items:center; padding:.6rem .8rem;
+           background:var(--bg); border-bottom:1px solid var(--ring);}
+      .brand{font-weight:700; letter-spacing:.3px}
+      .pill{background:var(--card); border:1px solid var(--ring); border-radius:999px; padding:.25rem .6rem; font-size:.85rem; color:var(--ink-dim)}
+      .btn{cursor:pointer; border:1px solid var(--ring); background:var(--card); color:var(--ink);
+           border-radius:10px; padding:.4rem .7rem; font-size:.9rem}
+      .spacer{flex:1}
+      .menu{display:flex; gap:.4rem; align-items:center}
+      .drop{position:absolute; right:.8rem; top:3rem; background:var(--card); border:1px solid var(--ring);
+            border-radius:12px; padding:.5rem; display:none; min-width:280px}
+      .drop.open{display:block}
+      .row{display:flex; align-items:center; justify-content:space-between; margin:.25rem 0}
+      .stat{font-weight:600; color:var(--ink)}
+      .sub{color:var(--ink-dim); font-size:.85rem}
+      details{border:1px solid var(--ring); border-radius:12px; padding:.5rem; margin-top:.5rem}
+      summary{cursor:pointer}
+      .mod{display:flex; justify-content:space-between; align-items:center; gap:.5rem; padding:.35rem 0; border-bottom:1px dashed #233}
+      .mod:last-child{border-bottom:none}
+      input,select,textarea{background:#0e1730; color:var(--ink); border:1px solid var(--ring); border-radius:8px; padding:.4rem}
+      textarea{width:100%; min-height:60px}
+    `;
+
+    // ===== Progress Journal (append-only, hash-chained) =====
+    class Journal {
+      constructor(dbName="eduHeaderDB"){ this.dbName=dbName; this.db=null; }
+      async _db(){
+        if(this.db) return this.db;
+        return this.db = await new Promise((res,rej)=>{
+          const r = indexedDB.open(this.dbName,1);
+          r.onupgradeneeded = () => {
+            const db = r.result;
+            if(!db.objectStoreNames.contains("events")) db.createObjectStore("events", { keyPath:"id", autoIncrement:true });
+            if(!db.objectStoreNames.contains("meta")) db.createObjectStore("meta");
+          };
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        });
+      }
+      async _get(store,key){
+        const db=await this._db();
+        return await new Promise((res,rej)=>{
+          const tx=db.transaction(store,"readonly").objectStore(store).get(key);
+          tx.onsuccess=()=>res(tx.result); tx.onerror=()=>rej(tx.error);
+        });
+      }
+      async _put(store,val,key){
+        const db=await this._db();
+        return await new Promise((res,rej)=>{
+          const tx=db.transaction(store,"readwrite").objectStore(store).put(val,key);
+          tx.onsuccess=()=>res(tx.result); tx.onerror=()=>rej(tx.error);
+        });
+      }
+      async lastHash(){ return (await this._get("meta","lastHash")) || null; }
+      async append(event){
+        // hash chain: Hn = sha256( H(n-1) || JSON(event) )
+        const prev = await this.lastHash();
+        const payload = { ...event, timestamp: new Date().toISOString(), prev };
+        const h = await sha256((prev||"") + JSON.stringify(payload));
+        payload.hash = h;
+        const id = await this._put("events", payload);
+        await this._put("meta", h, "lastHash");
+        return { id, hash:h };
+      }
+      async all(){
+        const db=await this._db();
+        return await new Promise((res,rej)=>{
+          const tx=db.transaction("events","readonly").objectStore("events").getAll();
+          tx.onsuccess=()=>res(tx.result||[]); tx.onerror=()=>rej(tx.error);
+        });
+      }
+      async exportBundle(){
+        const events = await this.all();
+        const summary = computeTotals(events);
+        return { version:"1.0", ts:new Date().toISOString(), summary, events };
+      }
+      async importBundle(bundle){
+        // merge by (timestamp,hash). Only append if new, preserving chain from lastHash.
+        const seen = new Set((await this.all()).map(e=>e.hash));
+        for(const e of bundle.events){
+          if(!seen.has(e.hash)){
+            // re-chain to local head; keep original as evidence_ref for provenance
+            const { timestamp, ...rest } = e;
+            await this.append({ type:"ImportedEvent", original:rest, note:"merged" });
+          }
+        }
+      }
+    }
+
+    // ===== Scoring (gentle curve) =====
+    const curve = lvl => Math.round(50 * Math.pow(lvl, 1.45));
+    function computeTotals(events){
+      let xp=0,seeds=0; const days=new Set();
+      for(const e of events){
+        if(e.type==="ReflectionLogged") xp+=10;
+        if(e.type==="QuestCompleted")   xp+=25;
+        if(e.type==="RitualVerified")   { xp+=Math.round(25*1.5); seeds++; }
+        days.add(todayKey(new Date(e.timestamp)));
+      }
+      let lvl=1, pool=xp, need=curve(1);
+      while(pool>=need && lvl<50){ pool-=need; lvl++; need=curve(lvl); }
+      return { xp, level:lvl, seeds, streak:days.size };
+    }
+
+    // ===== Plugin API (global, minimal) =====
+    const HeaderBus = new EventTarget();
+    const HeaderAPI = {
+      emit: (type, payload={}) => HeaderBus.dispatchEvent(new CustomEvent(type,{detail:payload})),
+      on:   (type, handler) => HeaderBus.addEventListener(type, e=>handler(e.detail)),
+      off:  (type, handler) => HeaderBus.removeEventListener(type, handler),
+      awardXP: (amount=25) => HeaderBus.dispatchEvent(new CustomEvent("QuestCompleted",{detail:{xp:amount}})),
+      logReflection: (mood=3,text="") => HeaderBus.dispatchEvent(new CustomEvent("ReflectionLogged",{detail:{mood,text}})),
+      verifyRitual: (ritual_id,gps=null) => HeaderBus.dispatchEvent(new CustomEvent("RitualVerified",{detail:{ritual_id,gps}})),
+      version: "1.0"
+    };
+    window.EduHeader = { API: HeaderAPI, Bus: HeaderBus };
+
+    // ===== Web Component =====
+    class EduHeaderEl extends HTMLElement{
+      constructor(){ super(); this.attachShadow({mode:"open"}); this.journal=new Journal(); this.state={xp:0,level:1,seeds:0,streak:0}; this.modules=[]; }
+      connectedCallback(){ this.render(); this.bind(); this.boot(); }
+      setStats(summary){
+        this.state=summary;
+        this.shadowRoot.querySelector("#stats").textContent =
+          `XP ${summary.xp} • L${summary.level} • Seeds ${summary.seeds} • Streak ${summary.streak}`;
+      }
+      async boot(){
+        // Load modules from data-modules or <script id="edu-modules"> inline JSON
+        try{
+          const inline = document.querySelector("#edu-modules");
+          this.modules = inline ? JSON.parse(inline.textContent) : JSON.parse(this.getAttribute("data-modules")||"[]");
+        }catch{ this.modules=[]; }
+        await this._wireBus();
+        await this._refresh();
+        this._renderModulesList();
+        this._autoLoadModules();
+      }
+      async _wireBus(){
+        const journal = this.journal;
+        HeaderAPI.on("ReflectionLogged", async d => { await journal.append({type:"ReflectionLogged", ...d}); await this._refresh(); });
+        HeaderAPI.on("QuestCompleted",   async d => { await journal.append({type:"QuestCompleted", ...d});   await this._refresh(); });
+        HeaderAPI.on("RitualVerified",   async d => { await journal.append({type:"RitualVerified", ...d});   await this._refresh(); });
+      }
+      async _refresh(){
+        const events = await this.journal.all();
+        this.setStats(computeTotals(events));
+      }
+      render(){
+        const t=this.getAttribute("data-title")||"Daily Loom";
+        this.shadowRoot.innerHTML = `
+          <style>${styles}</style>
+          <div class="hdr">
+            <div class="brand">🧭 ${t}</div>
+            <span class="pill" id="stats">XP 0 • L1 • Seeds 0 • Streak 0</span>
+            <div class="spacer"></div>
+            <div class="menu">
+              <button class="btn" id="quickReflect">Reflect</button>
+              <button class="btn" id="quickQuest">+ Quest</button>
+              <button class="btn" id="export">Export</button>
+              <button class="btn" id="more">⋯</button>
+            </div>
+            <div class="drop" id="panel">
+              <div class="row"><div class="stat">Header v1.0</div><div class="sub">Hackable • Offline</div></div>
+              <details>
+                <summary>Modules</summary>
+                <div id="mods"></div>
+                <div class="row" style="margin-top:.5rem; gap:.5rem">
+                  <input id="modUrl" placeholder="https://…/module.js" style="flex:1">
+                  <button class="btn" id="addMod">Load</button>
+                </div>
+              </details>
+              <details>
+                <summary>Import Bundle</summary>
+                <input type="file" id="fileIn" accept="application/json">
+              </details>
+            </div>
+          </div>
+        `;
+      }
+      _renderModulesList(){
+        const el=this.shadowRoot.querySelector("#mods");
+        el.innerHTML = this.modules.map(m => `<div class="mod"><span>${m.name||m.url}</span><button class="btn" data-load="${m.url}">Load</button></div>`).join("") || `<div class="sub">No modules listed yet.</div>`;
+        el.querySelectorAll("[data-load]").forEach(btn=>{
+          btn.onclick = () => this._loadModule(btn.getAttribute("data-load"));
+        });
+      }
+      async _autoLoadModules(){
+        for(const m of this.modules){ if(m.autoload) await this._loadModule(m.url).catch(()=>{}); }
+      }
+      async _loadModule(url){
+        const mod = await import(/* @vite-ignore */ url);
+        if(typeof mod.register === "function"){
+          mod.register(window.EduHeader.API);
+          this._toast(`Module loaded: ${url.split("/").pop()}`);
+        }else{
+          this._toast(`Module missing register()`);
+        }
+      }
+      _toast(msg){ console.log("[edu-header]", msg); }
+      bind(){
+        const $ = s=>this.shadowRoot.querySelector(s);
+        $("#more").onclick = () => $("#panel").classList.toggle("open");
+        $("#quickReflect").onclick = async () => {
+          const text = prompt("One line about how you feel right now?") || "";
+          window.EduHeader.API.logReflection(3, text);
+        };
+        $("#quickQuest").onclick = async () => {
+          const id = prompt("Quest ID or short label?") || "ad-hoc";
+          window.EduHeader.API.emit("QuestCompleted",{ quest_id:id, evidence_refs:[] });
+        };
+        $("#export").onclick = async () => {
+          const bundle = await this.journal.exportBundle();
+          const blob = new Blob([JSON.stringify(bundle,null,2)], { type:"application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "progress-bundle.json";
+          a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 1200);
+        };
+        $("#addMod").onclick = () => {
+          const url = this.shadowRoot.querySelector("#modUrl").value.trim();
+          if(url){ this._loadModule(url); }
+        };
+        $("#fileIn").addEventListener("change", async (e)=>{
+          const f=e.target.files[0]; if(!f) return;
+          const txt = await f.text();
+          const bundle = JSON.parse(txt);
+          await this.journal.importBundle(bundle);
+          await this._refresh();
+          this._toast("Bundle imported.");
+        });
+      }
+    }
+    customElements.define("edu-header", EduHeaderEl);
+  </script>
+
+  <!-- Optional inline module list for autoload -->
+  <!--
+  <script id="edu-modules" type="application/json">
+    [
+      {"name":"Quest Pack A","url":"https://yourcdn.example/questpack-a.module.js","autoload":true},
+      {"name":"EQ+Mentor Tools","url":"https://yourcdn.example/mentor-tools.module.js"}
+    ]
+  </script>
+  -->
+</body>
+</html>
